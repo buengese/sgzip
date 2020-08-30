@@ -35,6 +35,12 @@ const (
 	HuffmanOnly         = flate.HuffmanOnly
 )
 
+type GzipMetadata struct {
+	BlockSize int
+	Size      int64
+	BlockData []uint32
+}
+
 // A Writer is an io.WriteCloser.
 // Writes to a Writer are compressed and written to w.
 type Writer struct {
@@ -47,9 +53,10 @@ type Writer struct {
 	currentBuffer []byte
 	prevTail      []byte
 	digest        hash.Hash32
-	size          int
+	size          int64
 	closed        bool
 	buf           [10]byte
+	blockData     []uint32
 	errMu         sync.RWMutex
 	err           error
 	pushedErr     chan struct{}
@@ -116,7 +123,7 @@ func NewWriterLevel(w io.Writer, level int) (*Writer, error) {
 		return nil, fmt.Errorf("gzip: invalid compression level: %d", level)
 	}
 	z := new(Writer)
-	z.SetConcurrency(defaultBlockSize, runtime.GOMAXPROCS(0))
+	z.SetConcurrency(defaultBlockSize, 1)
 	z.init(w, level)
 	return z, nil
 }
@@ -193,27 +200,27 @@ func put4(p []byte, v uint32) {
 }
 
 // writeBytes writes a length-prefixed byte slice to z.w.
-func (z *Writer) writeBytes(b []byte) error {
+func (z *Writer) writeBytes(b []byte) (int, error) {
 	if len(b) > 0xffff {
-		return errors.New("gzip.Write: Extra data is too large")
+		return 0, errors.New("gzip.Write: Extra data is too large")
 	}
 	put2(z.buf[0:2], uint16(len(b)))
-	_, err := z.w.Write(z.buf[0:2])
+	n1, err := z.w.Write(z.buf[0:2])
 	if err != nil {
-		return err
+		return n1, err
 	}
-	_, err = z.w.Write(b)
-	return err
+	n2, err := z.w.Write(b)
+	return n1 + n2, err
 }
 
 // writeString writes a UTF-8 string s in GZIP's format to z.w.
 // GZIP (RFC 1952) specifies that strings are NUL-terminated ISO 8859-1 (Latin-1).
-func (z *Writer) writeString(s string) (err error) {
+func (z *Writer) writeString(s string) (written int, err error) {
 	// GZIP stores Latin-1 strings; error if non-Latin-1; convert if non-ASCII.
 	needconv := false
 	for _, v := range s {
 		if v == 0 || v > 0xff {
-			return errors.New("gzip.Write: non-Latin-1 header string")
+			return 0, errors.New("gzip.Write: non-Latin-1 header string")
 		}
 		if v > 0x7f {
 			needconv = true
@@ -224,17 +231,17 @@ func (z *Writer) writeString(s string) (err error) {
 		for _, v := range s {
 			b = append(b, byte(v))
 		}
-		_, err = z.w.Write(b)
+		written, err = z.w.Write(b)
 	} else {
-		_, err = io.WriteString(z.w, s)
+		written, err = io.WriteString(z.w, s)
 	}
 	if err != nil {
-		return err
+		return written, err
 	}
 	// GZIP strings are NUL-terminated.
 	z.buf[0] = 0
-	_, err = z.w.Write(z.buf[0:1])
-	return err
+	n, err := z.w.Write(z.buf[0:1])
+	return written + n, err
 }
 
 // compressCurrent will compress the data currently buffered
@@ -329,33 +336,39 @@ func (z *Writer) Write(p []byte) (int, error) {
 		}
 		z.buf[9] = z.OS
 		var n int
+		var hs int
 		var err error
 		n, err = z.w.Write(z.buf[0:10])
+		hs += n
 		if err != nil {
 			z.pushError(err)
 			return n, err
 		}
 		if z.Extra != nil {
-			err = z.writeBytes(z.Extra)
+			n, err = z.writeBytes(z.Extra)
+			hs += n
 			if err != nil {
 				z.pushError(err)
 				return n, err
 			}
 		}
 		if z.Name != "" {
-			err = z.writeString(z.Name)
+			n, err = z.writeString(z.Name)
+			hs += n
 			if err != nil {
 				z.pushError(err)
 				return n, err
 			}
 		}
 		if z.Comment != "" {
-			err = z.writeString(z.Comment)
+			n, err = z.writeString(z.Comment)
+			hs += n
 			if err != nil {
 				z.pushError(err)
 				return n, err
 			}
 		}
+		z.blockData = append(z.blockData, uint32(hs))
 		// Start receiving data from compressors
 		go func() {
 			listen := z.results
@@ -379,11 +392,12 @@ func (z *Writer) Write(p []byte) (int, error) {
 					continue
 				}
 				if n != len(buf) {
-					z.pushError(fmt.Errorf("gzip: short write %d should be %d", n, len(buf)))
+					z.pushError(fmt.Errorf("gzip: short write %d should be %d\n", n, len(buf)))
 					failed = true
 					close(r.notifyWritten)
 					continue
 				}
+				z.blockData = append(z.blockData, uint32(len(buf)))
 				z.dstPool.Put(buf)
 				close(r.notifyWritten)
 			}
@@ -408,7 +422,7 @@ func (z *Writer) Write(p []byte) (int, error) {
 				return len(p) - len(q) - length, err
 			}
 		}
-		z.size += length
+		z.size += int64(length)
 		q = q[length:]
 	}
 	return len(p), z.checkError()
@@ -482,8 +496,22 @@ func (z *Writer) Flush() error {
 
 // UncompressedSize will return the number of bytes written.
 // pgzip only, not a function in the official gzip package.
-func (z *Writer) UncompressedSize() int {
+func (z *Writer) UncompressedSize() int64 {
 	return z.size
+}
+
+// BlockData returns blockdata
+func (z *Writer) BlockData() []uint32 {
+	return z.blockData
+}
+
+// MetaData returns gzip metadata
+func (z *Writer) MetaData() GzipMetadata {
+	return GzipMetadata{
+		BlockSize: z.blockSize,
+		Size:      z.size,
+		BlockData: z.blockData,
+	}
 }
 
 // Close closes the Writer, flushing any unwritten data to the underlying
