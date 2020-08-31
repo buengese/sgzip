@@ -2,7 +2,7 @@
 // To run:   go test -v -count=1 -cpu=1,2,4,8,16 -tags=unreliable
 // +build unreliable,!race
 
-package pgzip
+package sgzip
 
 import (
 	"bytes"
