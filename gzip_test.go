@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/ioutil"
 	"math/rand"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -38,6 +39,21 @@ func TestEmpty(t *testing.T) {
 	}
 	if err := r.Close(); err != nil {
 		t.Fatalf("Reader.Close: %v", err)
+	}
+}
+
+func TestEmptyBlockData(t *testing.T) {
+	want := []uint32{10, 7}
+	buf := new(bytes.Buffer)
+
+	w := NewWriter(buf)
+	if err := w.Close(); err != nil {
+		t.Fatalf("Writer.Close: %v", err)
+	}
+
+	bd := w.BlockData()
+	if !reflect.DeepEqual(bd, want) {
+		t.Fatalf("want %+v, got: %+v", want, bd)
 	}
 }
 
@@ -90,7 +106,7 @@ func TestRoundTrip(t *testing.T) {
 func TestLatin1(t *testing.T) {
 	latin1 := []byte{0xc4, 'u', 0xdf, 'e', 'r', 'u', 'n', 'g', 0}
 	utf8 := "Äußerung"
-	z := Reader{r: bufio.NewReader(bytes.NewReader(latin1))}
+	z := Reader{bufr: bufio.NewReader(bytes.NewReader(latin1))}
 	s, err := z.readString()
 	if err != nil {
 		t.Fatalf("readString: %v", err)
@@ -101,7 +117,7 @@ func TestLatin1(t *testing.T) {
 
 	buf := bytes.NewBuffer(make([]byte, 0, len(latin1)))
 	c := Writer{w: buf}
-	if err = c.writeString(utf8); err != nil {
+	if _, err = c.writeString(utf8); err != nil {
 		t.Fatalf("writeString: %v", err)
 	}
 	s = buf.String()
@@ -298,7 +314,7 @@ func testBigGzip(i int, t *testing.T) {
 	w, _ := NewWriterLevel(&buf, 6)
 	io.Copy(w, br)
 	// Test UncompressedSize()
-	if len(testbuf) != w.UncompressedSize() {
+	if len(testbuf) != int(w.UncompressedSize()) {
 		t.Errorf("uncompressed size does not match. buffer:%d, UncompressedSize():%d", len(testbuf), w.UncompressedSize())
 	}
 	err := w.Close()
@@ -306,7 +322,7 @@ func testBigGzip(i int, t *testing.T) {
 		t.Fatal(err.Error())
 	}
 	// Close should not affect the number
-	if len(testbuf) != w.UncompressedSize() {
+	if len(testbuf) != int(w.UncompressedSize()) {
 		t.Errorf("uncompressed size does not match. buffer:%d, UncompressedSize():%d", len(testbuf), w.UncompressedSize())
 	}
 
@@ -340,17 +356,28 @@ func TestGzip10M(t *testing.T) {
 }
 
 // Test if two runs produce identical results.
-func TestDeterministicLM2(t *testing.T) { testDeterm(-2, t) }
-func TestDeterministicL0(t *testing.T)  { testDeterm(0, t) }
-func TestDeterministicL1(t *testing.T)  { testDeterm(1, t) }
-func TestDeterministicL2(t *testing.T)  { testDeterm(2, t) }
-func TestDeterministicL3(t *testing.T)  { testDeterm(3, t) }
-func TestDeterministicL4(t *testing.T)  { testDeterm(4, t) }
-func TestDeterministicL5(t *testing.T)  { testDeterm(5, t) }
-func TestDeterministicL6(t *testing.T)  { testDeterm(6, t) }
-func TestDeterministicL7(t *testing.T)  { testDeterm(7, t) }
-func TestDeterministicL8(t *testing.T)  { testDeterm(8, t) }
-func TestDeterministicL9(t *testing.T)  { testDeterm(9, t) }
+func TestDeterministicLM2(t *testing.T)      { testDeterm(-2, t) }
+func TestDeterministicBlockLM2(t *testing.T) { testDetermBlock(-2, t) }
+func TestDeterministicL0(t *testing.T)       { testDeterm(0, t) }
+func TestDeterministicBlockL0(t *testing.T)  { testDetermBlock(0, t) }
+func TestDeterministicL1(t *testing.T)       { testDeterm(1, t) }
+func TestDeterministicBlockL1(t *testing.T)  { testDetermBlock(1, t) }
+func TestDeterministicL2(t *testing.T)       { testDeterm(2, t) }
+func TestDeterministicBlockL2(t *testing.T)  { testDetermBlock(2, t) }
+func TestDeterministicL3(t *testing.T)       { testDeterm(3, t) }
+func TestDeterministicBlockL3(t *testing.T)  { testDetermBlock(3, t) }
+func TestDeterministicL4(t *testing.T)       { testDeterm(4, t) }
+func TestDeterministicBlockL4(t *testing.T)  { testDetermBlock(4, t) }
+func TestDeterministicL5(t *testing.T)       { testDeterm(5, t) }
+func TestDeterministicBlockL5(t *testing.T)  { testDetermBlock(5, t) }
+func TestDeterministicL6(t *testing.T)       { testDeterm(6, t) }
+func TestDeterministicBlockL6(t *testing.T)  { testDetermBlock(6, t) }
+func TestDeterministicL7(t *testing.T)       { testDeterm(7, t) }
+func TestDeterministicBlockL7(t *testing.T)  { testDetermBlock(7, t) }
+func TestDeterministicL8(t *testing.T)       { testDeterm(8, t) }
+func TestDeterministicBlockL8(t *testing.T)  { testDetermBlock(8, t) }
+func TestDeterministicL9(t *testing.T)       { testDeterm(9, t) }
+func TestDeterministicBlockL9(t *testing.T)  { testDetermBlock(9, t) }
 
 func testDeterm(i int, t *testing.T) {
 	var length = defaultBlockSize*defaultBlocks + 500
@@ -405,6 +432,62 @@ func testDeterm(i int, t *testing.T) {
 
 	if bytes.Compare(b1b, b2b) != 0 {
 		t.Fatalf("Level %d did not produce deterministric result, len(a) = %d, len(b) = %d", i, len(b1b), len(b2b))
+	}
+}
+
+func testDetermBlock(i int, t *testing.T) {
+	var length = defaultBlockSize*defaultBlocks + 500
+	if testing.Short() {
+		length = defaultBlockSize*2 + 500
+	}
+	rand.Seed(1337)
+	t1 := make([]byte, length)
+	for idx := range t1 {
+		t1[idx] = byte(65 + rand.Intn(8))
+	}
+
+	br := bytes.NewBuffer(t1)
+	var b1 bytes.Buffer
+	w, err := NewWriterLevel(&b1, i)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Use a very small prime sized buffer.
+	cbuf := make([]byte, 787)
+	_, err = copyBuffer(w, br, cbuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Flush()
+	w.Close()
+
+	rand.Seed(1337)
+	t2 := make([]byte, length)
+	for idx := range t2 {
+		t2[idx] = byte(65 + rand.Intn(8))
+	}
+
+	br2 := bytes.NewBuffer(t2)
+	var b2 bytes.Buffer
+	w2, err := NewWriterLevel(&b2, i)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// We choose a different buffer size,
+	// bigger than a maximum block, and also a prime.
+	cbuf = make([]byte, 81761)
+	_, err = copyBuffer(w2, br2, cbuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2.Flush()
+	w2.Close()
+
+	w1bd := w.BlockData()
+	w2bd := w2.BlockData()
+
+	if !reflect.DeepEqual(w1bd, w2bd) {
+		t.Fatalf("Level %d did not produce deterministric result, a.BlockData() = %+v, b.BlockData() = %+v", i, w1bd, w2bd)
 	}
 }
 

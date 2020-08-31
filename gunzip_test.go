@@ -8,8 +8,11 @@ import (
 	"bytes"
 	oldgz "compress/gzip"
 	"crypto/rand"
+	"encoding/gob"
+	"fmt"
 	"io"
 	"io/ioutil"
+	prand "math/rand"
 	"os"
 	"strings"
 	"testing"
@@ -23,22 +26,33 @@ type gunzipTest struct {
 	desc string
 	raw  string
 	gzip []byte
+	meta GzipMetadata
+	seek int64
 	err  error
 }
 
-var gunzipTests = []gunzipTest{
-	{ // has 1 empty fixed-huffman block
-		"empty.txt",
-		"empty.txt",
-		"",
-		[]byte{
-			0x1f, 0x8b, 0x08, 0x08, 0xf7, 0x5e, 0x14, 0x4a,
-			0x00, 0x03, 0x65, 0x6d, 0x70, 0x74, 0x79, 0x2e,
-			0x74, 0x78, 0x74, 0x00, 0x03, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		},
-		nil,
+var emptyStream = gunzipTest{ // has 1 empty fixed-huffman block
+	"empty.txt",
+	"empty.txt",
+	"",
+	[]byte{
+		0x1f, 0x8b, 0x08, 0x08, 0xf7, 0x5e, 0x14, 0x4a,
+		0x00, 0x03, 0x65, 0x6d, 0x70, 0x74, 0x79, 0x2e,
+		0x74, 0x78, 0x74, 0x00, 0x03, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	},
+	GzipMetadata{
+		BlockSize: defaultBlockSize,
+		Size:      0,
+		BlockData: []uint32{
+			20, 2,
+		},
+	},
+	0,
+	nil,
+}
+
+var seekingTests = []gunzipTest{
 	{ // has 1 non-empty fixed huffman block
 		"hello.txt",
 		"hello.txt",
@@ -51,27 +65,14 @@ var gunzipTests = []gunzipTest{
 			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
 			0x00, 0x00,
 		},
-		nil,
-	},
-	{ // concatenation
-		"hello.txt",
-		"hello.txt x2",
-		"hello world\n" +
-			"hello world\n",
-		[]byte{
-			0x1f, 0x8b, 0x08, 0x08, 0xc8, 0x58, 0x13, 0x4a,
-			0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
-			0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
-			0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
-			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
-			0x00, 0x00,
-			0x1f, 0x8b, 0x08, 0x08, 0xc8, 0x58, 0x13, 0x4a,
-			0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
-			0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
-			0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
-			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
-			0x00, 0x00,
+		GzipMetadata{
+			BlockSize: defaultBlockSize,
+			Size:      12,
+			BlockData: []uint32{
+				20, 56,
+			},
 		},
+		12,
 		nil,
 	},
 	{ // has a fixed huffman block with some length-distance pairs
@@ -88,6 +89,14 @@ var gunzipTests = []gunzipTest{
 			0x94, 0xca, 0x05, 0x00, 0x76, 0xb0, 0x3b, 0xeb,
 			0x24, 0x00, 0x00, 0x00,
 		},
+		GzipMetadata{
+			BlockSize: defaultBlockSize,
+			Size:      36,
+			BlockData: []uint32{
+				23, 29,
+			},
+		},
+		17,
 		nil,
 	},
 	{ // has dynamic huffman blocks
@@ -226,6 +235,40 @@ var gunzipTests = []gunzipTest{
 			0x4a, 0x65, 0x8f, 0x08, 0x42, 0x60, 0xf7, 0x0f,
 			0xb9, 0x16, 0x0b, 0x0c, 0x1a, 0x06, 0x00, 0x00,
 		},
+		GzipMetadata{
+			BlockSize: defaultBlockSize,
+			Size:      1562,
+			BlockData: []uint32{
+				21, 787,
+			},
+		},
+		721,
+		nil,
+	},
+}
+
+var errTests = []gunzipTest{
+	{ // concatenation
+		"hello.txt",
+		"hello.txt x2",
+		"hello world\n" +
+			"hello world\n",
+		[]byte{
+			0x1f, 0x8b, 0x08, 0x08, 0xc8, 0x58, 0x13, 0x4a,
+			0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
+			0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
+			0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
+			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
+			0x00, 0x00,
+			0x1f, 0x8b, 0x08, 0x08, 0xc8, 0x58, 0x13, 0x4a,
+			0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
+			0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
+			0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
+			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
+			0x00, 0x00,
+		},
+		GzipMetadata{},
+		0,
 		nil,
 	},
 	{ // has 1 non-empty fixed huffman block then garbage
@@ -240,6 +283,8 @@ var gunzipTests = []gunzipTest{
 			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
 			0x00, 0x00, 'g', 'a', 'r', 'b', 'a', 'g', 'e', '!', '!', '!',
 		},
+		GzipMetadata{},
+		0,
 		ErrHeader,
 	},
 	{ // has 1 non-empty fixed huffman block not enough header
@@ -254,6 +299,8 @@ var gunzipTests = []gunzipTest{
 			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
 			0x00, 0x00, gzipID1,
 		},
+		GzipMetadata{},
+		0,
 		io.ErrUnexpectedEOF,
 	},
 	{ // has 1 non-empty fixed huffman block but corrupt checksum
@@ -268,6 +315,8 @@ var gunzipTests = []gunzipTest{
 			0x02, 0x00, 0xff, 0xff, 0xff, 0xff, 0x0c, 0x00,
 			0x00, 0x00,
 		},
+		GzipMetadata{},
+		0,
 		ErrChecksum,
 	},
 	{ // has 1 non-empty fixed huffman block but corrupt size
@@ -282,9 +331,13 @@ var gunzipTests = []gunzipTest{
 			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0xff, 0x00,
 			0x00, 0x00,
 		},
+		GzipMetadata{},
+		0,
 		ErrChecksum,
 	},
 }
+
+var gunzipTests = append(append([]gunzipTest{emptyStream}, seekingTests...), errTests...)
 
 func TestDecompressor(t *testing.T) {
 	b := new(bytes.Buffer)
@@ -292,7 +345,7 @@ func TestDecompressor(t *testing.T) {
 		in := bytes.NewReader(tt.gzip)
 		gzip, err := NewReader(in)
 		if err != nil {
-			t.Errorf("%s: NewReader: %s", tt.name, err)
+			t.Errorf("%s: NewReader: %v", tt.name, err)
 			continue
 		}
 		defer gzip.Close()
@@ -313,11 +366,11 @@ func TestDecompressor(t *testing.T) {
 		in = bytes.NewReader(tt.gzip)
 		err = gzip.Reset(in)
 		if err != nil {
-			t.Errorf("%s: Reset: %s", tt.name, err)
+			t.Errorf("%s: Reset: %v", tt.name, err)
 			continue
 		}
 		if tt.name != gzip.Name {
-			t.Errorf("%s: got name %s", tt.name, gzip.Name)
+			t.Errorf("%s: got name %v", tt.name, gzip.Name)
 		}
 		b.Reset()
 		n, err = io.Copy(b, gzip)
@@ -331,11 +384,207 @@ func TestDecompressor(t *testing.T) {
 	}
 }
 
+func TestSeekUnseekable(t *testing.T) {
+	in := bytes.NewReader(emptyStream.gzip)
+	gzip, err := NewReader(in)
+	if err != nil {
+		t.Errorf("%s: NewReader: %v", emptyStream.name, err)
+	}
+	_, err = gzip.Seek(100000, io.SeekStart)
+	if err != ErrUnsupported {
+		t.Errorf("%s: gzip.Seek: %v want %v", emptyStream.name, err, ErrUnsupported)
+	}
+	gzip.Close()
+}
+
+func TestInvalidSeek(t *testing.T) {
+	in := bytes.NewReader(emptyStream.gzip)
+	gzip, err := NewSeekingReader(in, &emptyStream.meta)
+	if err != nil {
+		t.Errorf("%s: NewReader: %v", emptyStream.name, err)
+	}
+	_, err = gzip.Seek(100000, io.SeekStart)
+	if err != ErrInvalidSeek {
+		t.Errorf("%s: gzip.Seek: %v want %v", emptyStream.name, err, ErrInvalidSeek)
+	}
+	gzip.Close()
+}
+
+func TestDecompressorWithSeek(t *testing.T) {
+	b := new(bytes.Buffer)
+	for _, tt := range seekingTests {
+		fmt.Printf("Name: %s\n", tt.name)
+		in := bytes.NewReader(tt.gzip)
+		gzip, err := NewSeekingReader(in, &tt.meta)
+		if err != nil {
+			t.Errorf("%s: NewReader: %v", tt.name, err)
+			continue
+		}
+		defer gzip.Close()
+		if tt.name != gzip.Name {
+			t.Errorf("%s: got name %s", tt.name, gzip.Name)
+		}
+		b.Reset()
+		_, err = gzip.Seek(tt.seek, io.SeekStart)
+		if err != nil {
+			t.Errorf("%s: gzip.Seek error %v", tt.name, err)
+			continue
+		}
+		n, err := io.Copy(b, gzip)
+		if err != tt.err {
+			t.Errorf("%s: io.Copy: %v want %v", tt.name, err, tt.err)
+		}
+
+		s := b.Bytes()
+		raw := []byte(tt.raw)[tt.seek:]
+		if !bytes.Equal(s, raw) {
+			t.Errorf("%s: got %d-byte %x want %d-byte %x", tt.name, n, s, len(raw), raw)
+		}
+	}
+}
+
+func TestReaderAt(t *testing.T) {
+	b := new(bytes.Buffer)
+	tt := seekingTests[2]
+	gzip, err := NewReaderAt(bytes.NewReader(tt.gzip), &tt.meta, tt.seek)
+	if err != nil {
+		t.Fatalf("NewReaderAt: %v", err)
+	}
+	defer gzip.Close()
+	n, err := io.Copy(b, gzip)
+	if err != nil {
+		t.Errorf("io.Copy: %v", err)
+	}
+	s := b.Bytes()
+	raw := []byte(tt.raw)[tt.seek:]
+	if !bytes.Equal(s, raw) {
+		t.Errorf("%s: got %d-byte want %d-byte", tt.name, n, len(raw))
+	}
+}
+
+func TestDecompressFileWithSeek(t *testing.T) {
+	f, err := os.Open("testdata/test.json.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	mf, err := os.Open("testdata/test.json.dat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Close()
+	of, err := os.Open("testdata/test.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer of.Close()
+	var meta GzipMetadata
+	err = gob.NewDecoder(mf).Decode(&meta)
+	if err != nil {
+		t.Fatalf("Invalid metadata %s", err)
+	}
+
+	gzip, err := NewSeekingReader(f, &meta)
+	if err != nil {
+		t.Fatalf("NewReader(testdata/test.json.gz): %v", err)
+	}
+	defer gzip.Close()
+
+	if _, err = gzip.Seek(89179, io.SeekStart); err != nil {
+		t.Errorf("gzip.Seek error %v", err)
+	}
+	if _, err = of.Seek(89179, io.SeekStart); err != nil {
+		t.Errorf("of.Seek error %v", err)
+	}
+
+	var b1 = new(bytes.Buffer)
+	if _, err = io.Copy(b1, gzip); err != nil {
+		t.Errorf("gzip: io.Copy: %v", err)
+	}
+	var b2 = new(bytes.Buffer)
+	if _, err = io.Copy(b2, of); err != nil {
+		t.Errorf("of: io.Copy: %v", err)
+	}
+	if !bytes.Equal(b1.Bytes(), b2.Bytes()) {
+		t.Errorf("Seek did not match original file")
+	}
+}
+
+func TestMultiSeek(t *testing.T) {
+	f, err := os.Open("testdata/test.json.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	mf, err := os.Open("testdata/test.json.dat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Close()
+	of, err := os.Open("testdata/test.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer of.Close()
+	var meta GzipMetadata
+	err = gob.NewDecoder(mf).Decode(&meta)
+	if err != nil {
+		t.Fatalf("Invalid metadata %s", err)
+	}
+
+	gzip, err := NewSeekingReader(f, &meta)
+	if err != nil {
+		t.Fatalf("NewReader(testdata/test.json.gz): %v", err)
+	}
+	defer gzip.Close()
+
+	prand.Seed(1337)
+	var buf1 = make([]byte, 256)
+	var buf2 = make([]byte, 256)
+	for i := 0; i < 10; i++ {
+		pos := prand.Intn(147154)
+		_, err = gzip.Seek(int64(pos), io.SeekStart)
+		if err != nil {
+			t.Errorf("gzip.Seek error %v", err)
+		}
+		_, err = of.Seek(int64(pos), io.SeekStart)
+		if err != nil {
+			t.Errorf("of.Seek error %v", err)
+		}
+
+		_, err = gzip.Read(buf1)
+		if err != nil {
+			t.Errorf("gzip.Read error %v", err)
+		}
+		_, err = of.Read(buf2)
+		if err != nil {
+			t.Errorf("of.Read error %v", err)
+		}
+		if !bytes.Equal(buf1, buf2) {
+			t.Errorf("read does not match original file.")
+		}
+
+		// lets read another buffer just to make sure
+		_, err = gzip.Read(buf1)
+		if err != nil {
+			t.Errorf("gzip.Read error %v", err)
+		}
+		_, err = of.Read(buf2)
+		if err != nil {
+			t.Errorf("of.Read error %v", err)
+		}
+		if !bytes.Equal(buf1, buf2) {
+			t.Errorf("read does not match original file.")
+		}
+	}
+}
+
 func TestIssue6550(t *testing.T) {
 	f, err := os.Open("testdata/issue6550.gz")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer f.Close()
 	gzip, err := NewReader(f)
 	if err != nil {
 		t.Fatalf("NewReader(testdata/issue6550.gz): %v", err)
@@ -361,15 +610,50 @@ func TestIssue6550(t *testing.T) {
 
 func TestInitialReset(t *testing.T) {
 	var r Reader
-	if err := r.Reset(bytes.NewReader(gunzipTests[1].gzip)); err != nil {
+	if err := r.Reset(bytes.NewReader(seekingTests[1].gzip)); err != nil {
 		t.Error(err)
 	}
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, &r); err != nil {
 		t.Error(err)
 	}
-	if s := buf.String(); s != gunzipTests[1].raw {
+	if s := buf.String(); s != seekingTests[1].raw {
 		t.Errorf("got %q want %q", s, gunzipTests[1].raw)
+	}
+}
+
+func TestMultiReset(t *testing.T) {
+	var r Reader
+	for i := 0; i < 10; i++ {
+		if err := r.Reset(bytes.NewReader(seekingTests[1].gzip)); err != nil {
+			t.Error(err)
+		}
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, &r); err != nil {
+		t.Error(err)
+	}
+	if s := buf.String(); s != seekingTests[1].raw {
+		t.Errorf("got %q want %q", s, seekingTests[1].gzip)
+	}
+}
+
+func TestResetEOF(t *testing.T) {
+	in := bytes.NewReader(seekingTests[1].gzip)
+	r, err := NewReader(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(ioutil.Discard, r); err != nil {
+		t.Fatal(err)
+	}
+	// reset reader with same bytes.Reader that is now EOF
+	if err := r.Reset(in); err != io.EOF {
+		t.Errorf("reset: err=%v, want io.EOF", err)
+	}
+	// try reading something
+	if _, err := io.Copy(ioutil.Discard, r); err != io.EOF {
+		t.Errorf("io.Copy: err=%v, want io.EOF", err)
 	}
 }
 
@@ -637,7 +921,7 @@ func TestTruncatedGunzipBlocks(t *testing.T) {
 	rand.Read(in)
 	var buf bytes.Buffer
 	for i := 0; i < len(in); i += 512 {
-		enc,_ := kpgzip.NewWriterLevel(&buf, 0)
+		enc, _ := kpgzip.NewWriterLevel(&buf, 0)
 		_, err := enc.Write(in[:i])
 		if err != nil {
 			t.Fatal(err)
