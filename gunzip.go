@@ -12,7 +12,7 @@
 // so you can use it as a complete replacement for "compress/gzip".
 //
 // See more at https://github.com/klauspost/pgzip
-package pgzip
+package sgzip
 
 import (
 	"bufio"

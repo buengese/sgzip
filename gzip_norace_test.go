@@ -1,7 +1,7 @@
 // These tests are skipped when the race detector (-race) is on
 // +build !race
 
-package pgzip
+package sgzip
 
 import (
 	"bytes"
