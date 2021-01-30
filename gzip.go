@@ -20,7 +20,6 @@ import (
 
 const (
 	defaultBlockSize = 1 << 20
-	tailSize         = 16384
 	defaultBlocks    = 4
 )
 
@@ -35,6 +34,7 @@ const (
 	HuffmanOnly         = flate.HuffmanOnly
 )
 
+// GzipMetadata stores the Metadata necessary to seek in the compressed file
 type GzipMetadata struct {
 	BlockSize int
 	Size      int64
@@ -51,7 +51,6 @@ type Writer struct {
 	blockSize     int
 	blocks        int
 	currentBuffer []byte
-	prevTail      []byte
 	digest        hash.Hash32
 	size          int64
 	closed        bool
@@ -80,9 +79,6 @@ type result struct {
 // meaning blocks are split at 1 MB and up to the number of CPU threads
 // can be processing at once before the writer blocks.
 func (z *Writer) SetConcurrency(blockSize, blocks int) error {
-	if blockSize <= tailSize {
-		return fmt.Errorf("gzip: block size cannot be less than or equal to %d", tailSize)
-	}
 	if blocks <= 0 {
 		return errors.New("gzip: blocks cannot be zero or less")
 	}
@@ -164,7 +160,6 @@ func (z *Writer) init(w io.Writer, level int) {
 	z.wroteHeader = false
 	z.currentBuffer = nil
 	z.buf = [10]byte{}
-	z.prevTail = nil
 	z.size = 0
 	if z.dictFlatePool.New == nil {
 		z.dictFlatePool.New = func() interface{} {
@@ -264,17 +259,7 @@ func (z *Writer) compressCurrent(flush bool) {
 	}
 
 	z.wg.Add(1)
-	tail := z.prevTail
-	if len(c) > tailSize {
-		buf := z.dstPool.Get().([]byte) // Put in .compressBlock
-		// Copy tail from current buffer before handing the buffer over to the
-		// compressBlock goroutine.
-		buf = append(buf[:0], c[len(c)-tailSize:]...)
-		z.prevTail = buf
-	} else {
-		z.prevTail = nil
-	}
-	go z.compressBlock(c, tail, r, z.closed)
+	go z.compressBlock(c, r, z.closed)
 
 	z.currentBuffer = z.dstPool.Get().([]byte) // Put in .compressBlock
 	z.currentBuffer = z.currentBuffer[:0]
@@ -392,7 +377,7 @@ func (z *Writer) Write(p []byte) (int, error) {
 					continue
 				}
 				if n != len(buf) {
-					z.pushError(fmt.Errorf("gzip: short write %d should be %d\n", n, len(buf)))
+					z.pushError(fmt.Errorf("gzip: short write %d should be %d", n, len(buf)))
 					failed = true
 					close(r.notifyWritten)
 					continue
@@ -431,7 +416,7 @@ func (z *Writer) Write(p []byte) (int, error) {
 // Step 1: compresses buffer to buffer
 // Step 2: send writer to channel
 // Step 3: Close result channel to indicate we are done
-func (z *Writer) compressBlock(p, prevTail []byte, r result, closed bool) {
+func (z *Writer) compressBlock(p []byte, r result, closed bool) {
 	defer func() {
 		close(r.result)
 		z.wg.Done()
@@ -440,7 +425,7 @@ func (z *Writer) compressBlock(p, prevTail []byte, r result, closed bool) {
 	dest := bytes.NewBuffer(buf[:0])
 
 	compressor := z.dictFlatePool.Get().(*flate.Writer) // Put below
-	compressor.ResetDict(dest, prevTail)
+	compressor.ResetDict(dest, nil)
 	compressor.Write(p)
 	z.dstPool.Put(p) // Corresponding Get in .Write and .compressCurrent
 
@@ -457,10 +442,6 @@ func (z *Writer) compressBlock(p, prevTail []byte, r result, closed bool) {
 		}
 	}
 	z.dictFlatePool.Put(compressor) // Get above
-
-	if prevTail != nil {
-		z.dstPool.Put(prevTail) // Get in .compressCurrent
-	}
 
 	// Read back buffer
 	buf = dest.Bytes()

@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package pgzip implements reading and writing of gzip format compressed files,
-// as specified in RFC 1952.
+// Package sgzip implements a seekable version of gzip format compressed files,
+// compliant with RFC 1952.
 //
 // This is a drop in replacement for "compress/gzip".
 // This will split compression into blocks that are compressed in parallel.
@@ -212,6 +212,10 @@ func NewSeekingReader(r io.ReadSeeker, meta *GzipMetadata) (*Reader, error) {
 	return z, nil
 }
 
+// NewReaderAt creates a new Reader reading the given reader.
+// This is a special reader that starts at an offset and allows
+// seeking in the compressed file using the supplied metadata.
+// It is the caller's responsibility to call Close on the Reader when done.
 func NewReaderAt(r io.ReadSeeker, meta *GzipMetadata, pos int64) (*Reader, error) {
 	z := new(Reader)
 	z.concurrentBlocks = defaultBlocks
@@ -663,6 +667,10 @@ func (z *Reader) Read(p []byte) (n int, err error) {
 	return z.Read(p)
 }
 
+// WriteTo writes data to w until the buffer is drained or an error occurs.
+// The return value n is the number of bytes written; it always fits into an
+// int, but it is int64 to match the io.WriterTo interface. Any error
+// encountered during the write is also returned.
 func (z *Reader) WriteTo(w io.Writer) (n int64, err error) {
 	var buf []byte
 	var total int64 = 0
