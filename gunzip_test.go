@@ -390,8 +390,7 @@ func TestSeekUnseekable(t *testing.T) {
 	if err != nil {
 		t.Errorf("%s: NewReader: %v", emptyStream.name, err)
 	}
-	_, err = gzip.Seek(100000, io.SeekStart)
-	if err != ErrUnsupported {
+	if _, err = gzip.Seek(100000, io.SeekStart); err != ErrUnsupported {
 		t.Errorf("%s: gzip.Seek: %v want %v", emptyStream.name, err, ErrUnsupported)
 	}
 	gzip.Close()
@@ -403,8 +402,7 @@ func TestInvalidSeek(t *testing.T) {
 	if err != nil {
 		t.Errorf("%s: NewReader: %v", emptyStream.name, err)
 	}
-	_, err = gzip.Seek(100000, io.SeekStart)
-	if err != ErrInvalidSeek {
+	if _, err = gzip.Seek(100000, io.SeekStart); err != ErrInvalidSeek {
 		t.Errorf("%s: gzip.Seek: %v want %v", emptyStream.name, err, ErrInvalidSeek)
 	}
 	gzip.Close()
@@ -425,8 +423,7 @@ func TestDecompressorWithSeek(t *testing.T) {
 			t.Errorf("%s: got name %s", tt.name, gzip.Name)
 		}
 		b.Reset()
-		_, err = gzip.Seek(tt.seek, io.SeekStart)
-		if err != nil {
+		if _, err = gzip.Seek(tt.seek, io.SeekStart); err != nil {
 			t.Errorf("%s: gzip.Seek error %v", tt.name, err)
 			continue
 		}
@@ -463,50 +460,37 @@ func TestReaderAt(t *testing.T) {
 }
 
 func TestDecompressFileWithSeek(t *testing.T) {
-	f, err := os.Open("testdata/test.json.gz")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	mf, err := os.Open("testdata/test.json.dat")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mf.Close()
-	of, err := os.Open("testdata/test.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer of.Close()
-	var meta GzipMetadata
-	err = gob.NewDecoder(mf).Decode(&meta)
-	if err != nil {
-		t.Fatalf("Invalid metadata %s", err)
+	dat, _ := ioutil.ReadFile("testdata/test.json")
+	dl := len(dat)
+	if len(testbuf) != 200*dl {
+		// Make results predictable
+		testbuf = make([]byte, 200*dl)
+		for j := 0; j < 200; j++ {
+			copy(testbuf[j*dl:j*dl+dl], dat)
+		}
 	}
 
-	gzip, err := NewSeekingReader(f, &meta)
+	br := bytes.NewBuffer(testbuf)
+	var buf bytes.Buffer
+	w, _ := NewWriterLevel(&buf, 6)
+	io.Copy(w, br)
+	w.Close()
+	meta := w.MetaData()
+	//fmt.Printf("%v\n", meta)
+
+	r, err := NewSeekingReader(bytes.NewReader(buf.Bytes()), &meta)
 	if err != nil {
-		t.Fatalf("NewReader(testdata/test.json.gz): %v", err)
+		t.Fatal(err.Error())
 	}
-	defer gzip.Close()
-
-	if _, err = gzip.Seek(89179, io.SeekStart); err != nil {
-		t.Errorf("gzip.Seek error %v", err)
+	if _, err = r.Seek(int64(132*dl), io.SeekStart); err != nil {
+		t.Fatal(err.Error())
 	}
-	if _, err = of.Seek(89179, io.SeekStart); err != nil {
-		t.Errorf("of.Seek error %v", err)
+	decoded, err := ioutil.ReadAll(r)
+	if err != nil {
+		t.Fatal(err.Error())
 	}
-
-	var b1 = new(bytes.Buffer)
-	if _, err = io.Copy(b1, gzip); err != nil {
-		t.Errorf("gzip: io.Copy: %v", err)
-	}
-	var b2 = new(bytes.Buffer)
-	if _, err = io.Copy(b2, of); err != nil {
-		t.Errorf("of: io.Copy: %v", err)
-	}
-	if !bytes.Equal(b1.Bytes(), b2.Bytes()) {
-		t.Errorf("Seek did not match original file")
+	if !bytes.Equal(testbuf[132*dl:], decoded) {
+		t.Errorf("decoded content does not match.")
 	}
 }
 
@@ -539,8 +523,8 @@ func TestMultiSeek(t *testing.T) {
 	defer gzip.Close()
 
 	prand.Seed(1337)
-	var buf1 = make([]byte, 256)
-	var buf2 = make([]byte, 256)
+	var buf1 = make([]byte, 512)
+	var buf2 = make([]byte, 512)
 	for i := 0; i < 10; i++ {
 		pos := prand.Intn(147154)
 		_, err = gzip.Seek(int64(pos), io.SeekStart)
@@ -552,19 +536,6 @@ func TestMultiSeek(t *testing.T) {
 			t.Errorf("of.Seek error %v", err)
 		}
 
-		_, err = gzip.Read(buf1)
-		if err != nil {
-			t.Errorf("gzip.Read error %v", err)
-		}
-		_, err = of.Read(buf2)
-		if err != nil {
-			t.Errorf("of.Read error %v", err)
-		}
-		if !bytes.Equal(buf1, buf2) {
-			t.Errorf("read does not match original file.")
-		}
-
-		// lets read another buffer just to make sure
 		_, err = gzip.Read(buf1)
 		if err != nil {
 			t.Errorf("gzip.Read error %v", err)
